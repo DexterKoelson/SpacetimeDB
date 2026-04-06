@@ -40,7 +40,9 @@ import {
 import {
   WebsocketDecompressAdapter,
   type WebsocketAdapter,
+  type WebSocketCloseEvent,
 } from './websocket_decompress_adapter.ts';
+import type { WebsocketTestAdapter } from './websocket_test_adapter.ts';
 import {
   SubscriptionBuilderImpl,
   SubscriptionHandleImpl,
@@ -83,6 +85,30 @@ export type {
 
 export type ConnectionEvent = 'connect' | 'disconnect' | 'connectError';
 
+/**
+ * Context passed to the `shouldReconnect` callback when a WebSocket disconnects.
+ * Contains information about why the connection was closed.
+ */
+export type DisconnectContext = {
+  /** The WebSocket close code (e.g., 1000 for normal, 1006 for abnormal). */
+  code: number;
+  /** The WebSocket close reason string. */
+  reason: string;
+  /** Whether the close was clean (initiated by server/client close handshake). */
+  wasClean: boolean;
+};
+
+export type ReconnectOptions = {
+  shouldReconnect: (
+    ctx: DisconnectContext,
+    attempt: number
+  ) => boolean | Promise<boolean>;
+  /** Initial delay in ms before the first reconnect attempt. Default: 1000. */
+  initialDelay?: number;
+  /** Maximum delay in ms between reconnect attempts. Default: 30000. */
+  maxDelay?: number;
+};
+
 export type DbConnectionConfig<RemoteModule extends UntypedRemoteModule> = {
   uri: URL;
   nameOrAddress: string;
@@ -94,6 +120,7 @@ export type DbConnectionConfig<RemoteModule extends UntypedRemoteModule> = {
   lightMode: boolean;
   confirmedReads?: boolean;
   remoteModule: RemoteModule;
+  reconnect?: ReconnectOptions;
 };
 
 type ProcedureCallback = (result: ProcedureResultMessage['result']) => void;
@@ -201,6 +228,21 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
   #boundSubscriptionBuilder!: () => SubscriptionBuilderImpl<RemoteModule>;
   #boundDisconnect!: () => void;
 
+  // Reconnect state
+  #reconnectOptions?: ReconnectOptions;
+  #reconnectAttempt = 0;
+  #reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  #disconnectedByUser = false;
+  #wsGeneration = 0;
+  #wsConfig: {
+    url: URL;
+    nameOrAddress: string;
+    compression: 'gzip' | 'none';
+    lightMode: boolean;
+    confirmedReads?: boolean;
+    createWSFn: typeof WebsocketDecompressAdapter.createWebSocketFn;
+  };
+
   // These fields are not part of the public API, but in a pinch you
   // could use JavaScript to access them by bypassing TypeScript's
   // private fields.
@@ -220,6 +262,7 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
     compression,
     lightMode,
     confirmedReads,
+    reconnect,
   }: DbConnectionConfig<RemoteModule>) {
     stdbLogger('info', 'Connecting to SpacetimeDB WS...');
 
@@ -233,6 +276,17 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
 
     this.identity = identity;
     this.token = token;
+    this.#reconnectOptions = reconnect;
+
+    // Save config for reconnect (before modifying url with connection_id)
+    this.#wsConfig = {
+      url: new URL(url.toString()),
+      nameOrAddress,
+      compression,
+      lightMode,
+      confirmedReads,
+      createWSFn,
+    };
 
     this.#remoteModule = remoteModule;
     this.#emitter = emitter;
@@ -304,23 +358,22 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
     })
       .then(v => {
         this.ws = v;
-
-        this.ws.onclose = () => {
-          this.#emitter.emit('disconnect', this);
-          this.isActive = false;
-        };
-        this.ws.onerror = (e: ErrorEvent) => {
-          this.#emitter.emit('connectError', this, e);
-          this.isActive = false;
-        };
-        this.ws.onopen = this.#handleOnOpen.bind(this);
-        this.ws.onmessage = this.#handleOnMessage.bind(this);
+        this.#attachWsHandlers(v);
         return v;
       })
       .catch(e => {
         stdbLogger('error', 'Error connecting to SpacetimeDB WS');
         this.#emitter.emit('connectError', this, e);
-
+        // If initial connection failed (e.g. token exchange HTTP error),
+        // no WebSocket was created so no onclose will fire. Trigger
+        // reconnect manually if configured.
+        if (!this.#disconnectedByUser && this.#reconnectOptions) {
+          this.#attemptReconnect({
+            code: 0,
+            reason: String(e),
+            wasClean: false,
+          });
+        }
         return undefined;
       });
   }
@@ -603,30 +656,44 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
 
   #reducerArgsEncoder = new BinaryWriter(1024);
   #clientMessageEncoder = new BinaryWriter(1024);
-  #sendEncodedMessage(encoded: Uint8Array, describe: () => string): void {
-    if (this.ws && this.isActive) {
-      if (this.#outboundQueue.length) this.#flushOutboundQueue(this.ws);
-
-      stdbLogger('trace', describe);
-      this.ws.send(encoded);
-    } else {
-      stdbLogger('trace', describe);
-      // use slice() to copy, in case the clientMessageEncoder's buffer gets used
-      this.#outboundQueue.push(encoded.slice());
-    }
-  }
-
-  #sendMessage(message: ClientMessage): void {
+  #encodeMessage(message: ClientMessage): Uint8Array {
     const writer = this.#clientMessageEncoder;
     writer.clear();
     ClientMessage.serialize(writer, message);
-    const encoded = writer.getBuffer();
-    const isLive = !!(this.ws && this.isActive);
-    this.#sendEncodedMessage(encoded, () =>
-      isLive
-        ? `Sending message to server: ${stringify(message)}`
-        : `Queuing message to server: ${stringify(message)}`
-    );
+    return writer.getBuffer().slice();
+  }
+
+  #sendMessage(message: ClientMessage): void {
+    const generation = this.#wsGeneration;
+    this.wsPromise.then(wsResolved => {
+      // Drop messages from a previous WebSocket generation (pre-reconnect)
+      if (generation !== this.#wsGeneration) return;
+      if (!wsResolved || !this.isActive) {
+        this.#outboundQueue.push(this.#encodeMessage(message));
+        return;
+      }
+      this.#flushOutboundQueue(wsResolved);
+      stdbLogger(
+        'trace',
+        () => `Sending message to server: ${stringify(message)}`
+      );
+      wsResolved.send(this.#encodeMessage(message));
+    });
+  }
+
+  #sendEncodedMessage(encoded: Uint8Array, describe: () => string): void {
+    const generation = this.#wsGeneration;
+    this.wsPromise.then(wsResolved => {
+      if (generation !== this.#wsGeneration) return;
+      if (!wsResolved || !this.isActive) {
+        stdbLogger('trace', describe);
+        this.#outboundQueue.push(encoded);
+        return;
+      }
+      this.#flushOutboundQueue(wsResolved);
+      stdbLogger('trace', describe);
+      wsResolved.send(encoded);
+    });
   }
 
   #sendCallReducerMessage(
@@ -641,7 +708,7 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
     writer.writeU8(0);
     writer.writeUInt8Array(reducerNameBytes);
     writer.writeUInt8Array(argsBuffer);
-    const encoded = writer.getBuffer();
+    const encoded = writer.getBuffer().slice();
     this.#sendEncodedMessage(
       encoded,
       () => `Sending reducer call message to server: requestId=${requestId}`
@@ -660,7 +727,7 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
     writer.writeU8(0);
     writer.writeUInt8Array(procedureNameBytes);
     writer.writeUInt8Array(argsBuffer);
-    const encoded = writer.getBuffer();
+    const encoded = writer.getBuffer().slice();
     this.#sendEncodedMessage(
       encoded,
       () => `Sending procedure call message to server: requestId=${requestId}`
@@ -684,6 +751,165 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
     this.isActive = true;
     if (this.ws) {
       this.#flushOutboundQueue(this.ws);
+    }
+  }
+
+  /**
+   * Attaches WebSocket event handlers for close, error, open, and message.
+   * Used by both the initial connection and reconnect.
+   */
+  #attachWsHandlers(
+    ws: WebsocketDecompressAdapter | WebsocketTestAdapter
+  ): void {
+    ws.onclose = (event: WebSocketCloseEvent) => {
+      this.isActive = false;
+      const error = !event.wasClean
+        ? new Error(
+            `WebSocket closed unexpectedly (code: ${event.code}, reason: ${event.reason || 'none'})`
+          )
+        : undefined;
+      this.#emitter.emit('disconnect', this, error);
+      if (!this.#disconnectedByUser) {
+        this.#attemptReconnect(event);
+      }
+    };
+    ws.onerror = (e: ErrorEvent) => {
+      this.#emitter.emit('connectError', this, e);
+      this.isActive = false;
+    };
+    ws.onopen = this.#handleOnOpen.bind(this);
+    ws.onmessage = this.#handleOnMessage.bind(this);
+  }
+
+  /**
+   * Evaluates whether to reconnect and schedules the attempt with
+   * exponential backoff (1s, 2s, 4s, 8s, ... up to 30s) plus jitter.
+   */
+  async #attemptReconnect(closeEvent: DisconnectContext): Promise<void> {
+    if (this.#disconnectedByUser || !this.#reconnectOptions) return;
+
+    const attempt = this.#reconnectAttempt;
+
+    let shouldReconnect: boolean;
+    try {
+      shouldReconnect = await this.#reconnectOptions.shouldReconnect(
+        closeEvent,
+        attempt
+      );
+    } catch {
+      shouldReconnect = false;
+    }
+
+    if (!shouldReconnect || this.#disconnectedByUser) return;
+
+    // Exponential backoff with jitter
+    const initialDelay = this.#reconnectOptions.initialDelay ?? 1000;
+    const maxDelay = this.#reconnectOptions.maxDelay ?? 30000;
+    const delay = Math.min(initialDelay * Math.pow(2, attempt), maxDelay);
+    const jitter = delay * 0.2 * Math.random();
+
+    stdbLogger(
+      'info',
+      `Scheduling reconnect attempt ${attempt + 1} in ${Math.round(delay + jitter)}ms`
+    );
+
+    this.#reconnectTimer = setTimeout(async () => {
+      this.#reconnectTimer = null;
+      if (this.#disconnectedByUser) return;
+
+      this.#reconnectAttempt++;
+
+      try {
+        await this.#reconnect();
+      } catch (e) {
+        // createWSFn failed (e.g. HTTP error during token exchange).
+        // No WebSocket was created, so no onclose will fire.
+        // Trigger retry manually.
+        stdbLogger('warn', `Reconnect attempt ${attempt + 1} failed: ${e}`);
+        this.#emitter.emit('connectError', this, e);
+        this.#attemptReconnect(closeEvent);
+      }
+    }, delay + jitter);
+  }
+
+  /**
+   * Creates a new WebSocket connection using the saved config,
+   * clearing stale state from the previous connection.
+   */
+  async #reconnect(): Promise<void> {
+    const {
+      url,
+      nameOrAddress,
+      compression,
+      lightMode,
+      confirmedReads,
+      createWSFn,
+    } = this.#wsConfig;
+
+    stdbLogger('info', 'Attempting to reconnect to SpacetimeDB...');
+
+    // Increment generation to invalidate any in-flight sends from old WS
+    this.#wsGeneration++;
+
+    // Clear stale state from previous connection
+    this.#clearStaleState();
+
+    // Create new WebSocket
+    const ws = await createWSFn({
+      url: new URL(url.toString()),
+      nameOrAddress,
+      wsProtocol: 'v2.bsatn.spacetimedb',
+      authToken: this.token,
+      compression,
+      lightMode,
+      confirmedReads,
+    });
+
+    this.ws = ws;
+    this.wsPromise = Promise.resolve(ws);
+
+    // Attach event handlers (including reconnect-on-close)
+    this.#attachWsHandlers(ws);
+  }
+
+  /**
+   * Clears state that is stale after a disconnect: client cache, subscription
+   * entries, pending reducer/procedure callbacks, and the outbound queue.
+   */
+  #clearStaleState(): void {
+    // Replace the client cache so the db view getters return fresh tables.
+    // The arrow-function getters in #makeDbView capture `this`, so they
+    // will automatically read from the new clientCache instance.
+    this.clientCache = new ClientCache<RemoteModule>();
+
+    // Clear subscription manager entries (server-side subscriptions are gone)
+    this.#subscriptionManager = new SubscriptionManager<RemoteModule>();
+
+    // Reject pending reducer callbacks
+    for (const [, cb] of this.#reducerCallbacks) {
+      cb({ tag: 'InternalError', value: 'Connection lost' });
+    }
+    this.#reducerCallbacks.clear();
+    this.#reducerCallInfo.clear();
+
+    // Reject pending procedure callbacks
+    for (const [, cb] of this.#procedureCallbacks) {
+      cb({ tag: 'Err', value: 'Connection lost' });
+    }
+    this.#procedureCallbacks.clear();
+
+    // Clear outbound queue (stale messages for old connection)
+    this.#outboundQueue = [];
+
+    // Reset inbound message queue
+    this.#inboundQueue.length = 0;
+    this.#inboundQueueOffset = 0;
+  }
+
+  #cancelReconnect(): void {
+    if (this.#reconnectTimer !== null) {
+      clearTimeout(this.#reconnectTimer);
+      this.#reconnectTimer = null;
     }
   }
 
@@ -743,6 +969,7 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
           this.token = serverMessage.value.token;
         }
         this.#setConnectionId(serverMessage.value.connectionId);
+        this.#reconnectAttempt = 0;
         this.#emitter.emit('connect', this, this.identity, this.token);
         break;
       }
@@ -752,7 +979,7 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
           this.#subscriptionManager.subscriptions.get(querySetId);
         if (!subscription) {
           stdbLogger(
-            'error',
+            'warn',
             `Received SubscribeApplied for unknown querySetId ${querySetId}.`
           );
           return;
@@ -784,7 +1011,7 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
           this.#subscriptionManager.subscriptions.get(querySetId);
         if (!subscription) {
           stdbLogger(
-            'error',
+            'warn',
             `Received UnsubscribeApplied for unknown querySetId ${querySetId}.`
           );
           return;
@@ -844,7 +1071,7 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
           this.#subscriptionManager.subscriptions.delete(querySetId);
         } else {
           stdbLogger(
-            'error',
+            'warn',
             `Received SubscriptionError for unknown querySetId ${querySetId}:`,
             error
           );
@@ -956,7 +1183,15 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
         const data = this.#inboundQueue[this.#inboundQueueOffset];
         this.#inboundQueueOffset += 1;
         if (data) {
-          this.#processMessage(data);
+          try {
+            this.#processMessage(data);
+          } catch (e) {
+            stdbLogger(
+              'error',
+              'Uncaught error while processing server message:',
+              e
+            );
+          }
         }
       }
     } finally {
@@ -1187,7 +1422,13 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
    * ```
    */
   disconnect(): void {
-    this.wsPromise.then(ws => ws?.close());
+    this.#disconnectedByUser = true;
+    this.#cancelReconnect();
+    this.wsPromise.then(wsResolved => {
+      if (wsResolved) {
+        wsResolved.close();
+      }
+    });
   }
 
   private on(
@@ -1238,5 +1479,15 @@ export class DbConnectionImpl<RemoteModule extends UntypedRemoteModule>
     callback: (ctx: DbConnectionImpl<RemoteModule>, ...args: any[]) => void
   ): void {
     this.#emitter.off('connectError', callback);
+  }
+
+  /**
+   * Cancel any pending reconnect attempt without closing the current connection.
+   * After calling this, the SDK will not automatically reconnect if the
+   * connection drops.
+   */
+  cancelReconnect(): void {
+    this.#cancelReconnect();
+    this.#reconnectOptions = undefined;
   }
 }

@@ -204,6 +204,9 @@ class ConnectionManagerImpl {
             managed.onConnectError as any
           );
         }
+        // Cancel any pending reconnect timers before disconnecting
+        // to prevent leaked timers after the component unmounts.
+        managed.connection.cancelReconnect();
         managed.connection.disconnect();
       }
       this.#connections.delete(key);

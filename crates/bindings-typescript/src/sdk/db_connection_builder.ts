@@ -1,4 +1,9 @@
-import { DbConnectionImpl, type ConnectionEvent } from './db_connection_impl';
+import {
+  DbConnectionImpl,
+  type ConnectionEvent,
+  type DisconnectContext,
+  type ReconnectOptions,
+} from './db_connection_impl';
 import { EventEmitter } from './event_emitter';
 import type {
   DbConnectionConfig,
@@ -27,6 +32,7 @@ export class DbConnectionBuilder<DbConnection extends DbConnectionImpl<any>> {
   #lightMode: boolean = false;
   #confirmedReads?: boolean;
   #createWSFn: typeof WebsocketDecompressAdapter.createWebSocketFn;
+  #reconnectOptions?: ReconnectOptions;
 
   /**
    * Creates a new `DbConnectionBuilder` database client and set the initial parameters.
@@ -133,6 +139,57 @@ export class DbConnectionBuilder<DbConnection extends DbConnectionImpl<any>> {
    */
   withConfirmedReads(confirmedReads: boolean): this {
     this.#confirmedReads = confirmedReads;
+    return this;
+  }
+
+  /**
+   * Enable automatic reconnection when the WebSocket connection drops.
+   *
+   * Accepts either a `shouldReconnect` callback or a full options object.
+   *
+   * The `shouldReconnect` callback is called each time the connection is lost.
+   * It receives a `DisconnectContext` (with the WebSocket close code, reason,
+   * and whether the close was clean) and the current retry attempt number
+   * (starting from 0). Return `true` to attempt reconnection, or `false` to
+   * stop. The callback may be async.
+   *
+   * Reconnection uses exponential backoff with 20% jitter. The attempt counter
+   * resets to 0 after a successful reconnection.
+   *
+   * When a reconnection succeeds, the `onConnect` callback fires again, and
+   * React hooks (e.g. `useTable`) automatically re-subscribe.
+   *
+   * @param options - A `shouldReconnect` callback, or an options object with:
+   *   - `shouldReconnect` — callback as described above
+   *   - `initialDelay` — ms before first retry (default 1000), doubles each attempt
+   *   - `maxDelay` — ceiling in ms for the backoff (default 30000)
+   *
+   * @example
+   *
+   * ```ts
+   * // Simple — default backoff (1s, 2s, 4s, ... up to 30s)
+   * .withAutoReconnect((ctx, attempt) => attempt < 10)
+   *
+   * // Custom timing — 500ms, 1s, 2s, ... up to 10s
+   * .withAutoReconnect({
+   *   shouldReconnect: (ctx, attempt) => attempt < 10,
+   *   initialDelay: 500,
+   *   maxDelay: 10_000,
+   * })
+   * ```
+   */
+  withAutoReconnect(
+    options:
+      | ((
+          ctx: DisconnectContext,
+          attempt: number
+        ) => boolean | Promise<boolean>)
+      | ReconnectOptions
+  ): this {
+    this.#reconnectOptions =
+      typeof options === 'function'
+        ? { shouldReconnect: options }
+        : options;
     return this;
   }
 
@@ -276,6 +333,7 @@ export class DbConnectionBuilder<DbConnection extends DbConnectionImpl<any>> {
       confirmedReads: this.#confirmedReads,
       createWSFn: this.#createWSFn,
       remoteModule: this.remoteModule,
+      reconnect: this.#reconnectOptions,
     });
   }
 }

@@ -1,32 +1,26 @@
 import { decompress } from './decompress';
 import { resolveWS } from './ws';
 
-export interface WebsocketAdapter {
-  send(msg: Uint8Array): void;
-  close(): void;
+export type WebSocketCloseEvent = {
+  code: number;
+  reason: string;
+  wasClean: boolean;
+};
 
-  set onclose(handler: (ev: CloseEvent) => void);
-  set onopen(handler: () => void);
-  set onmessage(handler: (msg: { data: Uint8Array }) => void);
-  set onerror(handler: (msg: ErrorEvent) => void);
+export interface WebsocketAdapter {
+  send(msg: any): void;
+  close(): void;
+  onclose?: ((event: any) => void) | null;
+  onopen?: ((...ev: any[]) => void) | null;
+  onmessage?: ((msg: { data: Uint8Array }) => void) | null;
+  onerror?: ((msg: any) => void) | null;
 }
 
 export class WebsocketDecompressAdapter implements WebsocketAdapter {
-  set onclose(handler: (ev: CloseEvent) => void) {
-    this.#ws.onclose = handler;
-  }
-  set onopen(handler: () => void) {
-    this.#ws.onopen = handler;
-  }
-  set onmessage(handler: (msg: { data: Uint8Array }) => void) {
-    this.#ws.onmessage = async (msg: MessageEvent<ArrayBuffer>) => {
-      const data = await this.#decompress(new Uint8Array(msg.data));
-      handler({ data });
-    };
-  }
-  set onerror(handler: (msg: ErrorEvent) => void) {
-    this.#ws.onerror = handler as (msg: Event) => void;
-  }
+  onclose?: (event: WebSocketCloseEvent) => void;
+  onopen?: (...ev: any[]) => void;
+  onmessage?: (msg: { data: Uint8Array }) => void;
+  onerror?: (msg: ErrorEvent) => void;
 
   #ws: WebSocket;
 
@@ -49,7 +43,23 @@ export class WebsocketDecompressAdapter implements WebsocketAdapter {
     }
   }
 
-  send(msg: Uint8Array): void {
+  #handleOnOpen(msg: any) {
+    this.onopen?.(msg);
+  }
+
+  #handleOnError(msg: any) {
+    this.onerror?.(msg);
+  }
+
+  #handleOnClose(msg: any) {
+    this.onclose?.({
+      code: msg?.code ?? 1006,
+      reason: msg?.reason ?? '',
+      wasClean: msg?.wasClean ?? false,
+    });
+  }
+
+  send(msg: any): void {
     this.#ws.send(msg);
   }
 
@@ -61,6 +71,14 @@ export class WebsocketDecompressAdapter implements WebsocketAdapter {
     ws.binaryType = 'arraybuffer';
 
     this.#ws = ws;
+
+    ws.onopen = this.#handleOnOpen.bind(this);
+    ws.onerror = this.#handleOnError.bind(this);
+    ws.onclose = this.#handleOnClose.bind(this);
+    ws.onmessage = async (msg: MessageEvent<ArrayBuffer>) => {
+      const data = await this.#decompress(new Uint8Array(msg.data));
+      this.onmessage?.({ data });
+    };
   }
 
   static async createWebSocketFn({

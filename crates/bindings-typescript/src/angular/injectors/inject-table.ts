@@ -141,8 +141,14 @@ export function injectTable<TableDef extends UntypedTableDef>(
   effect((onCleanup: (fn: () => void) => void) => {
     const state = connState();
     if (!state.isActive) {
+      // Connection dropped — mark subscription as not ready
+      subscribeApplied = false;
+      updateSnapshot();
       return;
     }
+
+    // Reset so isLoading reflects the new subscription's state
+    subscribeApplied = false;
 
     const connection = state.getConnection();
     if (!connection) {

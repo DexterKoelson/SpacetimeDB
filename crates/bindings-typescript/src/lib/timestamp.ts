@@ -139,6 +139,27 @@ export class Timestamp {
     return isoBase.replace(/\.\d{3}Z$/, `.${fractionalPart}Z`);
   }
 
+  /**
+   * Returns the underlying microseconds as a primitive value,
+   * enabling relational comparisons like `>`, `<`, `>=`, `<=` between `Timestamp` instances.
+   *
+   * Note: `===` compares by reference for objects and cannot be overridden.
+   * Use {@link equals} for equality checks instead.
+   */
+  valueOf(): bigint {
+    return this.__timestamp_micros_since_unix_epoch__;
+  }
+
+  /**
+   * Check if this timestamp represents the same point in time as `other`.
+   */
+  equals(other: Timestamp): boolean {
+    return (
+      this.__timestamp_micros_since_unix_epoch__ ===
+      other.__timestamp_micros_since_unix_epoch__
+    );
+  }
+
   since(other: Timestamp): TimeDuration {
     return new TimeDuration(
       this.__timestamp_micros_since_unix_epoch__ -

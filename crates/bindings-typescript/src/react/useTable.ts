@@ -20,11 +20,16 @@ import {
   getQueryWhereClause,
 } from '../lib/query';
 
-export interface UseTableCallbacks<RowType> {
+export interface UseTableOptions<RowType> {
   onInsert?: (row: RowType) => void;
   onDelete?: (row: RowType) => void;
   onUpdate?: (oldRow: RowType, newRow: RowType) => void;
+  /** Whether the subscription is active. Defaults to `true`. */
+  enabled?: boolean;
 }
+
+/** @deprecated Use {@link UseTableOptions} instead. */
+export type UseTableCallbacks<RowType> = UseTableOptions<RowType>;
 
 type MembershipChange = 'enter' | 'leave' | 'stayIn' | 'stayOut';
 
@@ -49,8 +54,10 @@ function classifyMembership(
  * - `tables.user` — subscribe to all rows
  * - `tables.user.where(r => r.online.eq(true))` — subscribe with a filter
  *
+ * Pass `{ enabled: false }` to disable the subscription without unmounting.
+ *
  * @param query - A query builder expression (table reference or filtered query).
- * @param callbacks - Optional callbacks for row insert, delete, and update events.
+ * @param options - Optional callbacks and `enabled` flag (default `true`).
  * @returns A tuple of [rows, isReady].
  *
  * @example
@@ -60,13 +67,16 @@ function classifyMembership(
  *   tables.user.where(r => r.online.eq(true)),
  *   { onInsert: (row) => console.log('New user:', row) }
  * );
+ * // Conditionally disable
+ * const [rows, isReady] = useTable(tables.user, { enabled: isNeeded });
  * ```
  */
 export function useTable<TableDef extends UntypedTableDef>(
   query: Query<TableDef>,
-  callbacks?: UseTableCallbacks<Prettify<RowType<TableDef>>>
+  options?: UseTableOptions<Prettify<RowType<TableDef>>>
 ): [readonly Prettify<RowType<TableDef>>[], boolean] {
   type UseTableRowType = RowType<TableDef>;
+  const enabled = options?.enabled ?? true;
   const accessorName = getQueryAccessorName(query);
   const whereExpr = getQueryWhereClause(query);
 
@@ -93,6 +103,9 @@ export function useTable<TableDef extends UntypedTableDef>(
     readonly Prettify<UseTableRowType>[],
     boolean,
   ] => {
+    if (!enabled) {
+      return [[], true];
+    }
     const connection = connectionState.getConnection();
     if (!connection) {
       return [[], false];
@@ -107,7 +120,7 @@ export function useTable<TableDef extends UntypedTableDef>(
     // TODO: investigating refactoring so that this is no longer necessary, as we have had genuine bugs with missed deps.
     // See https://github.com/clockworklabs/SpacetimeDB/pull/4580.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connectionState, accessorName, querySql, subscribeApplied]);
+  }, [connectionState, accessorName, querySql, subscribeApplied, enabled]);
 
   // Invalidate the cached snapshot when computeSnapshot changes (e.g. when
   // subscribeApplied flips to true) so getSnapshot() recomputes on the next
@@ -117,8 +130,14 @@ export function useTable<TableDef extends UntypedTableDef>(
   }, [computeSnapshot]);
 
   useEffect(() => {
+    if (!enabled) {
+      setSubscribeApplied(false);
+      return;
+    }
     const connection = connectionState.getConnection()!;
     if (connectionState.isActive && connection) {
+      // Reset so isReady reflects the new subscription's state
+      setSubscribeApplied(false);
       const cancel = connection
         .subscriptionBuilder()
         .onApplied(() => {
@@ -128,11 +147,18 @@ export function useTable<TableDef extends UntypedTableDef>(
       return () => {
         cancel.unsubscribe();
       };
+    } else {
+      // Connection dropped — mark subscription as not ready
+      setSubscribeApplied(false);
     }
-  }, [querySql, connectionState.isActive, connectionState]);
+  }, [querySql, connectionState.isActive, connectionState, enabled]);
 
   const subscribe = useCallback(
     (onStoreChange: () => void) => {
+      if (!enabled) {
+        return () => {};
+      }
+
       const onInsert = (
         ctx: EventContextInterface<UntypedRemoteModule>,
         row: any
@@ -140,7 +166,7 @@ export function useTable<TableDef extends UntypedTableDef>(
         if (whereExpr && !evaluateBooleanExpr(whereExpr, row)) {
           return;
         }
-        callbacks?.onInsert?.(row);
+        options?.onInsert?.(row);
         if (ctx.event.id !== latestTransactionEventId.current) {
           latestTransactionEventId.current = ctx.event.id;
           lastSnapshotRef.current = computeSnapshot();
@@ -155,7 +181,7 @@ export function useTable<TableDef extends UntypedTableDef>(
         if (whereExpr && !evaluateBooleanExpr(whereExpr, row)) {
           return;
         }
-        callbacks?.onDelete?.(row);
+        options?.onDelete?.(row);
         if (ctx.event.id !== latestTransactionEventId.current) {
           latestTransactionEventId.current = ctx.event.id;
           lastSnapshotRef.current = computeSnapshot();
@@ -172,13 +198,13 @@ export function useTable<TableDef extends UntypedTableDef>(
 
         switch (change) {
           case 'leave':
-            callbacks?.onDelete?.(oldRow);
+            options?.onDelete?.(oldRow);
             break;
           case 'enter':
-            callbacks?.onInsert?.(newRow);
+            options?.onInsert?.(newRow);
             break;
           case 'stayIn':
-            callbacks?.onUpdate?.(oldRow, newRow);
+            options?.onUpdate?.(oldRow, newRow);
             break;
           case 'stayOut':
             return; // no-op
@@ -215,9 +241,10 @@ export function useTable<TableDef extends UntypedTableDef>(
       accessorName,
       querySql,
       computeSnapshot,
-      callbacks?.onDelete,
-      callbacks?.onInsert,
-      callbacks?.onUpdate,
+      options?.onDelete,
+      options?.onInsert,
+      options?.onUpdate,
+      enabled,
     ]
   );
 
